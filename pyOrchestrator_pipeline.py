@@ -10,22 +10,52 @@ import ee
 import geemap
 import os, glob
 import rasterio
-import sys
-import shutil
 import rpy2.robjects as robjects
+import sys
+import pandas as pd
+import sqlalchemy
+import geopandas as gpd
+import json    
+from sqlalchemy import create_engine
+import time
 
 #Initiate GEE
 
 #ee.Authenticate()
 ee.Initialize()
 
+
 class TalhonamentoAutomatico:
     def __init__(self, start, end, cod):
         self.start = ee.Date(start)
         self.end = ee.Date(end)
-        self.path = os.getcwd()
+        self.path = r'C:\Projetos\monitoramento\pipeline_cadastro'
         self.cod = cod
-        self.CAR = ee.FeatureCollection('projects/ee-carbonei/assets/area_imovel/cars_all_ufs').filter(ee.Filter.eq('cod_imovel', cod))
+        
+        uf = cod[0:2].lower()
+        
+        user = 'ferraz'
+        password = '3ino^Vq3^R1!'
+        host = 'vps40890.publiccloud.com.br'
+        port = 5432
+        database = 'carbon'
+        
+        engine = create_engine(
+                url="postgresql+psycopg2://{0}:{1}@{2}:{3}/{4}".format(
+                    user, password, host, port, database
+                )
+            )
+        
+        q = "select st_asgeojson(geom) as geom from car.area_imovel_{0} where cod_imovel  = '{1}'".format(uf, cod)
+        
+        geom = pd.read_sql_query(q,con=engine)
+        gdf = gpd.read_file(geom['geom'][0], driver='GeoJSON')
+        geo_json = gdf.to_json()
+        j = json.loads(geo_json)
+        self.CAR  = ee.FeatureCollection(j)
+        
+        #self.CAR = ee.FeatureCollection('projects/ee-carbonei/assets/area_imovel/cars_all_ufs').filter(ee.Filter.eq('cod_imovel', cod))
+        #self.CAR = ee.FeatureCollection('projects/ee-carbonei/assets/MT-5102686-235C60F3726D4809B96D1F6A5B4B731E')
     
     def getMasks(self):
         # Mask
@@ -35,6 +65,7 @@ class TalhonamentoAutomatico:
         
         def create_mask(image, mask, value):
             return image.updateMask(mask.eq(value))
+        
         
         # def mask_image(image): 
         #      return create_mask(image, merx_to_2022, 1)
@@ -77,6 +108,7 @@ class TalhonamentoAutomatico:
         
     def get_dataset(self):  
         
+        soja_br = ee.FeatureCollection('projects/ee-carbonei/assets/mapeamento/merx_soja_br_2022_grid5x5')
         fb = self.CAR
         
         S2_ts = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -97,18 +129,13 @@ class TalhonamentoAutomatico:
         nameOfBands = image.bandNames().getInfo()
         nameOfBands.remove("QA60")
         image = image.select(nameOfBands) 
-    
-        elevation = (ee.ImageCollection('JAXA/ALOS/AW3D30/V3_2')
-                .filterBounds(fb)
-                .select('DSM')
-                .first())
-    
-        slope = ee.Terrain.slope(elevation).rename('SLOPE')       
-        elevation = elevation.addBands(slope)
-    
-        elevationImage = elevation.clip(fb)
+        
+        srtm = ee.Image('USGS/SRTMGL1_003').rename('DSM')     
+        slope = ee.Terrain.slope(srtm).rename('SLOPE')
         
         mask_all = self.getMasks()
+        
+        elevationImage = srtm.addBands(slope).mask(mask_all).clip(fb)
         
         soil_property = "projects/soilgrids-isric/clay_mean"
         layers = ["clay_0-5cm_mean", "clay_5-15cm_mean", "clay_15-30cm_mean", "clay_30-60cm_mean"]
@@ -120,9 +147,40 @@ class TalhonamentoAutomatico:
         dataset = image.addBands([elevationImage, soil_property, soil_property_areia])
     
         dataset = dataset.resample('bilinear').reproject(crs=crs, scale=10)
-        dataset = dataset.mask(mask_all)
-        
-        return dataset
+        dataset = dataset.mask(mask_all).clip(fb)
+        try:
+            soy_masked = dataset.clip(soja_br)
+            
+            stat_soy = soy_masked.select("B1").reduceRegion (
+              reducer= ee.Reducer.count(),
+              geometry= fb,
+              scale= 10,
+              maxPixels= 1e9
+            )
+            count_soy = stat_soy.getInfo()["B1"]
+            
+            stat_whole = dataset.select("B1").reduceRegion (
+              reducer= ee.Reducer.count(),
+              geometry= fb,
+              scale= 10,
+              maxPixels= 1e9
+            )
+            count_whole = stat_whole.getInfo()["B1"]
+            
+            proportion = count_soy/count_whole
+            
+            if(proportion > 0.10):
+                result = soy_masked
+            else:
+                result = dataset
+                
+            print("Overlay between CAR and soy mask detected")
+        except:
+            result = dataset
+            print("No overlay between CAR and soy mask")
+        finally:
+            return result
+       
     
     def export_dataset(self, dataset):
         
@@ -143,7 +201,6 @@ class TalhonamentoAutomatico:
             os.makedirs(out_dir)
         
         #filename = os.path.join(self.path, '_')
-        
         
         for name in dataset.bandNames().getInfo():
             
@@ -194,23 +251,24 @@ class TalhonamentoAutomatico:
                         #layer = np.where(layer==0,0,layer)
                         dst.write_band(id + 1, src1.read(1).astype('float32'))
     
-    def executeR(self, out_dir):
+    def executeR(self):
         r_source = robjects.r['source']
         r_source(self.path + '\\execute.R')
 
     
     def execute(self):
-        im = self.get_dataset()
         
+        im = self.get_dataset()
         doa = ee.Date(im.get('system:time_start')).format('YYYY-MM-dd').getInfo()
         out_dir = self.export_dataset(im)
         self.get_stack(out_dir, doa)
-        self.executeR(out_dir)
+        self.executeR()
         
         
-if __name__=="__main__":
-    t = TalhonamentoAutomatico('2022-08-01', '2022-08-30', 'TO-1700707-4B994681854F4341899F4D877E127609')
-    t.execute()       
+        
+if __name__ == '__main__':
+    t = TalhonamentoAutomatico(sys.argv[1], sys.argv[2], sys.argv[3])
+    t.execute()
     
 
 
